@@ -46,10 +46,9 @@ class SerialReader(QtCore.QThread):
                             except Exception:
                                 pass
                         continue
-                    # Expect "ID,value" or just "value"
-                    parts = line.split(",")
-                    value_str = parts[-1]
-                    value = float(value_str)
+                    value = self._extract_velocity(line)
+                    if value is None:
+                        continue
                     ts = time.time()
                     self.data_received.emit(self._port_name, ts, value)
                     self._last_data_ts = ts
@@ -66,6 +65,47 @@ class SerialReader(QtCore.QThread):
     def stop(self):
         self._stop = True
         self.wait(500)
+
+    @staticmethod
+    def _extract_velocity(line: str):
+        if not line:
+            return None
+        s = line.strip()
+        if not s:
+            return None
+        # Direct float line
+        try:
+            return float(s)
+        except ValueError:
+            pass
+
+        # Pretty-print from STM32 (e.g., "v_inst=0.123 m/s")
+        match = re.search(r"v_inst\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", s)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                pass
+
+        # CSV format: timestamp,raw,net,force,v_inst,v_filt
+        parts = [p.strip() for p in s.split(",")]
+        if len(parts) >= 5:
+            try:
+                return float(parts[4])
+            except ValueError:
+                pass
+
+        # Generic "key=value" tokens separated by pipes or commas
+        for token in re.split(r"[|,]", s):
+            if "v_inst" in token:
+                match = re.search(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", token)
+                if match:
+                    try:
+                        return float(match.group(1))
+                    except ValueError:
+                        continue
+
+        return None
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, devices, max_points=3000, refresh_ms=30, window_seconds=15, max_speed=10.0, min_speed=0.0):

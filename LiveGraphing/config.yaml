@@ -3,7 +3,7 @@ devices:
     port: /dev/tty.usbmodem141303
     baud: 115200
   - name: Student
-    port: /dev/tty.usbmodem11403
+    port: /dev/tty.usbmodem21203
     baud: 115200
 ui:
   max_points: 3000
