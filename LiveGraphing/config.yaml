@@ -1,0 +1,15 @@
+devices:
+  - name: Ground Truth
+    port: /dev/tty.usbmodem141303
+    baud: 115200
+  - name: Student
+    port: /dev/tty.usbmodem11403
+    baud: 115200
+ui:
+  max_points: 3000
+  refresh_ms: 30
+  window_seconds: 15
+  max_speed: 1000
+  min_speed: -1
+  log_rate_hz: 20
+  align_tolerance_ms: 40
