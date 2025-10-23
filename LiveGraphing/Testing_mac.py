@@ -1,5 +1,6 @@
-import sys, time, collections, os, re, csv
-from PySide6 import QtCore, QtWidgets
+import sys, time, collections, os, re, csv, math, argparse
+from pathlib import Path
+from PySide6 import QtCore, QtWidgets, QtGui
 import pyqtgraph as pg
 import serial, serial.tools.list_ports
 try:
@@ -8,7 +9,7 @@ except ImportError:
     yaml = None
 
 class SerialReader(QtCore.QThread):
-    data_received = QtCore.Signal(str, float, float)  # port, ts, value
+    data_received = QtCore.Signal(str, float, float, float)  # port, ts, v_inst, v_filt
     disconnected = QtCore.Signal(str)  # port
 
     def __init__(self, port_name: str, baud: int = 115200, parent=None):
@@ -46,11 +47,14 @@ class SerialReader(QtCore.QThread):
                             except Exception:
                                 pass
                         continue
-                    value = self._extract_velocity(line)
-                    if value is None:
+                    parsed = self._extract_velocity(line)
+                    if parsed is None:
                         continue
+                    v_inst, v_filt = parsed
                     ts = time.time()
-                    self.data_received.emit(self._port_name, ts, value)
+                    if v_filt is None:
+                        v_filt = float('nan')
+                    self.data_received.emit(self._port_name, ts, v_inst, v_filt)
                     self._last_data_ts = ts
                 except ValueError:
                     continue
@@ -75,40 +79,71 @@ class SerialReader(QtCore.QThread):
             return None
         # Direct float line
         try:
-            return float(s)
+            return float(s), None
         except ValueError:
             pass
 
-        # Pretty-print from STM32 (e.g., "v_inst=0.123 m/s")
-        match = re.search(r"v_inst\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", s)
-        if match:
-            try:
-                return float(match.group(1))
-            except ValueError:
-                pass
+        v_inst = None
+        v_filt = None
 
         # CSV format: timestamp,raw,net,force,v_inst,v_filt
         parts = [p.strip() for p in s.split(",")]
         if len(parts) >= 5:
             try:
-                return float(parts[4])
+                v_inst = float(parts[4])
             except ValueError:
-                pass
+                v_inst = None
+            if len(parts) >= 6:
+                try:
+                    v_filt = float(parts[5])
+                except ValueError:
+                    v_filt = None
+
+        # Pretty-print from STM32 (e.g., "v_inst=0.123 m/s | v_filt=0.456 m/s")
+        if v_inst is None or v_filt is None:
+            inst_match = re.search(r"v_inst\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", s)
+            filt_match = re.search(r"v_filt\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", s)
+            if inst_match and v_inst is None:
+                try:
+                    v_inst = float(inst_match.group(1))
+                except ValueError:
+                    v_inst = None
+            if filt_match and v_filt is None:
+                try:
+                    v_filt = float(filt_match.group(1))
+                except ValueError:
+                    v_filt = None
 
         # Generic "key=value" tokens separated by pipes or commas
-        for token in re.split(r"[|,]", s):
-            if "v_inst" in token:
-                match = re.search(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", token)
-                if match:
-                    try:
-                        return float(match.group(1))
-                    except ValueError:
-                        continue
+        if v_inst is None:
+            for token in re.split(r"[|,]", s):
+                if "v_inst" in token:
+                    match = re.search(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", token)
+                    if match:
+                        try:
+                            v_inst = float(match.group(1))
+                            break
+                        except ValueError:
+                            continue
 
-        return None
+        if v_filt is None:
+            for token in re.split(r"[|,]", s):
+                if "v_filt" in token:
+                    match = re.search(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)", token)
+                    if match:
+                        try:
+                            v_filt = float(match.group(1))
+                            break
+                        except ValueError:
+                            continue
+
+        if v_inst is None:
+            return None
+
+        return v_inst, v_filt
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, devices, max_points=3000, refresh_ms=30, window_seconds=15, max_speed=10.0, min_speed=0.0):
+    def __init__(self, devices, max_points=3000, refresh_ms=30, window_seconds=15, max_speed=10.0, min_speed=0.0, record_all=False):
         super().__init__()
         self.setWindowTitle("NUCLEO Live Plot")
         self.resize(900, 500)
@@ -160,9 +195,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.max_speed = float(max_speed)
         self.min_speed = float(min_speed)
         self.port_to_name = {}
+        self.is_student = {}
         self.logging_active = False
         self.log_rows = []
         self.log_by_port = {}
+        self.log_start_ts = None
+        self.record_all = bool(record_all)
         # Error line state
         self.err_lower = {}
         self.err_upper = {}
@@ -173,7 +211,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dp_error_pa = 0.62
         self.error_speed_floor = 0.2
 
-        self.palette = ['c', 'm', 'y', 'g', 'r', 'b', 'w']
+        self.palette = [
+            '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
+            '#9467bd', '#8c564b', '#e377c2', '#17becf', '#bcbd22'
+        ]
         self.next_color_idx = 0
         self.readers = []
         self.known_ports = set()
@@ -187,16 +228,33 @@ class MainWindow(QtWidgets.QMainWindow):
             baud = int(dev.get('baud', 115200))
             if not port:
                 continue
-
+            grp = _modem_group(port)
+            if self.ground_truth_port is None:
+                self.ground_truth_port = port
+                self.ground_truth_group = grp
+                is_student = False
+            else:
+                is_student = (grp != self.ground_truth_group)
+                if is_student and self.student_port is None:
+                    self.student_port = port
+            self.is_student[port] = is_student
             # buffers per port
-            self.buffers[port] = (
-                collections.deque(maxlen=self.max_points),
-                collections.deque(maxlen=self.max_points),
-            )
+            self.buffers[port] = {
+                't': collections.deque(maxlen=self.max_points),
+                'inst': collections.deque(maxlen=self.max_points),
+                'filt': collections.deque(maxlen=self.max_points),
+            }
 
-            # curve per port
-            color = self.palette[self.next_color_idx % len(self.palette)]
-            self.next_color_idx += 1
+            # curves per port
+            if is_student:
+                color_idx = self.next_color_idx % len(self.palette)
+                inst_color = QtGui.QColor(self.palette[color_idx])
+                filt_color = QtGui.QColor(self.palette[(color_idx + 1) % len(self.palette)])
+                self.next_color_idx += 2
+            else:
+                inst_color = None
+                filt_color = QtGui.QColor(self.palette[self.next_color_idx % len(self.palette)])
+                self.next_color_idx += 1
             label = f"{name} ({port})" if name and name != port else port
 
             # numeric readout per device
@@ -205,18 +263,29 @@ class MainWindow(QtWidgets.QMainWindow):
             device_layout.setContentsMargins(8, 4, 8, 4)
             title_label = QtWidgets.QLabel(label)
             title_label.setStyleSheet("color: #666; font-size: 12pt;")
-            value_label = QtWidgets.QLabel("—")
+            value_label = QtWidgets.QLabel("inst: —\nfilt: —" if is_student else "—")
             value_label.setStyleSheet("font-size: 24pt; font-weight: 600;")
             device_layout.addWidget(title_label)
             device_layout.addWidget(value_label)
             self.header_layout.addWidget(device_widget)
             self.value_labels[port] = value_label
-            self.curves[port] = self.plot.plot(pen=pg.mkPen(color, width=2), name=label)
+            if is_student:
+                inst_curve = self.plot.plot(pen=pg.mkPen(inst_color, width=2), name=f"{label} (inst)")
+                filt_pen = pg.mkPen(filt_color, width=2, style=QtCore.Qt.PenStyle.DotLine)
+                filt_curve = self.plot.plot(pen=filt_pen, name=f"{label} (filt)")
+            else:
+                inst_curve = None
+                filt_curve = self.plot.plot(pen=pg.mkPen(filt_color, width=2), name=label)
+            self.curves[port] = {
+                'inst': inst_curve,
+                'filt': filt_curve,
+            }
             self.port_to_name[port] = name
             self.log_by_port.setdefault(port, [])
 
             # error lines for this device
-            base_pen = self.curves[port].opts['pen']
+            base_pen_source = inst_curve if inst_curve is not None else filt_curve
+            base_pen = base_pen_source.opts['pen']
             qcolor = base_pen.color()
             dash_pen = pg.mkPen(qcolor, style=QtCore.Qt.PenStyle.DashLine)
             self.err_lower[port] = self.plot.plot(pen=dash_pen)
@@ -235,13 +304,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.known_ports.add(port)
             self.port_to_reader[port] = reader
 
-            # Initialize ground truth tracking from the first configured device
-            if self.ground_truth_port is None:
-                self.ground_truth_port = port
-                self.ground_truth_group = _modem_group(port)
-            else:
-                # Any subsequent attached device at init is considered student
-                self.student_port = port
 
         # Apply fixed y-range now that max_speed is known
         try:
@@ -264,35 +326,67 @@ class MainWindow(QtWidgets.QMainWindow):
         # Hook up logging toggle
         self.btn_log.clicked.connect(self.toggle_logging)
 
-    @QtCore.Slot(str, float, float)
-    def on_data(self, port, ts, value):
-        t_rel = ts - self.t0
-        # Clip incoming values to keep scale stable
-        clipped = value
+        # Prepare output directory for log files
         try:
-            if clipped < self.min_speed:
-                clipped = self.min_speed
-            if clipped > self.max_speed:
-                clipped = self.max_speed
-        except Exception:
-            pass
-        tbuf, vbuf = self.buffers[port]
+            self.log_dir = Path(__file__).resolve().parent.parent / "runs"
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            print(f"[warn] Failed to ensure runs/ directory: {exc}. Falling back to current working directory.")
+            self.log_dir = Path.cwd()
+
+    @QtCore.Slot(str, float, float, float)
+    def on_data(self, port, ts, value, value_filt):
+        t_rel = ts - self.t0
+        buf = self.buffers.get(port)
+        if buf is None:
+            return
+
+        def clip(v):
+            try:
+                if v < self.min_speed:
+                    return self.min_speed
+                if v > self.max_speed:
+                    return self.max_speed
+            except Exception:
+                pass
+            return v
+
+        inst_clipped = clip(value)
+        if value_filt is None or math.isnan(value_filt):
+            filt_clipped = float('nan')
+        else:
+            filt_clipped = clip(value_filt)
+
+        tbuf = buf['t']
+        inst_buf = buf['inst']
+        filt_buf = buf['filt']
         tbuf.append(t_rel)
-        vbuf.append(clipped)
+        inst_buf.append(inst_clipped)
+        filt_buf.append(filt_clipped)
+
         lbl = self.value_labels.get(port)
         if lbl is not None:
             try:
-                lbl.setText(f"{clipped:.3f} m/s")
+                if self.is_student.get(port, False):
+                    if math.isnan(filt_clipped):
+                        lbl.setText(f"inst: {inst_clipped:.3f} m/s\nfilt: —")
+                    else:
+                        lbl.setText(f"inst: {inst_clipped:.3f} m/s\nfilt: {filt_clipped:.3f} m/s")
+                else:
+                    display_val = filt_clipped
+                    if math.isnan(display_val):
+                        display_val = inst_clipped
+                    lbl.setText(f"{display_val:.3f} m/s")
             except Exception:
                 pass
-        # Logging rows: ISO time, epoch, t_rel, device_name, port, raw, clipped, expected_error_pct
-        if self.logging_active:
-            try:
+
+        # Logging rows: ISO time, epoch, t_rel, device_name, port, inst_raw, inst_clipped, filt_clipped, expected_error_pct
+        try:
+            if self.logging_active:
                 iso = time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(ts)) + f".{int((ts%1)*1000):03d}Z"
                 rho = float(getattr(self, 'air_density', 1.204))
                 dp = float(getattr(self, 'dp_error_pa', 0.62))
-                vabs = abs(float(clipped))
-                # Only compute error for ground truth device
+                vabs = abs(float(inst_clipped))
                 is_gt = (_modem_group(port) == getattr(self, 'ground_truth_group', None))
                 if is_gt and vabs > 1e-12:
                     dv_abs = dp / (rho * vabs)
@@ -307,13 +401,15 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.port_to_name.get(port, port) or port,
                     port,
                     f"{float(value):.6f}",
-                    f"{float(clipped):.6f}",
+                    f"{float(inst_clipped):.6f}",
+                    '' if math.isnan(filt_clipped) else f"{float(filt_clipped):.6f}",
                     err_pct_str,
                 ]
                 self.log_rows.append(row)
-                self.log_by_port.setdefault(port, []).append((ts, float(clipped)))
-            except Exception:
-                pass
+                filt_entry = None if math.isnan(filt_clipped) else float(filt_clipped)
+                self.log_by_port.setdefault(port, []).append((ts, float(inst_clipped), filt_entry))
+        except Exception:
+            pass
 
     def refresh(self):
         # Apply log mode if requested
@@ -328,13 +424,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
         latest_ts = None
         # Update curves and error lines; find latest timestamp
-        for port, curve in self.curves.items():
-            tbuf, vbuf = self.buffers[port]
-            if not tbuf:
+        for port, curve_dict in self.curves.items():
+            buf = self.buffers.get(port)
+            if not buf or not buf['t']:
                 continue
-            t_list = list(tbuf)
-            v_list = list(vbuf)
-            curve.setData(t_list, v_list)
+            t_list = list(buf['t'])
+            inst_list = list(buf['inst'])
+            filt_list = list(buf['filt'])
+            curve_inst = curve_dict.get('inst')
+            curve_filt = curve_dict.get('filt')
+            if curve_inst is not None:
+                curve_inst.setData(t_list, inst_list)
+            if curve_filt is not None:
+                curve_filt.setData(t_list, filt_list)
 
             # dp-based error: dv = dp / (rho * max(|v|, floor))
             rho = float(getattr(self, 'air_density', 1.204))
@@ -343,7 +445,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lower = []
             upper = []
             min_floor = self.min_speed if not getattr(self, 'y_log', False) else max(self.min_speed, 1e-6)
-            for v in v_list:
+            for v in inst_list:
                 denom = rho * max(abs(v), v_floor)
                 dv = (dp / denom) if denom > 0 else 0.0
                 lo = v - dv
@@ -372,16 +474,26 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 t_cut = None
             for port in self.curves.keys():
-                tbuf, vbuf = self.buffers[port]
-                if not tbuf:
+                buf = self.buffers.get(port)
+                if not buf or not buf['t']:
                     continue
+                tbuf = buf['t']
+                inst_vbuf = buf['inst']
+                filt_vbuf = buf['filt']
+                values = []
+                local_max = None
                 if t_cut is None:
-                    local_max = max(vbuf)
+                    values.extend(v for v in inst_vbuf if not math.isnan(v))
+                    values.extend(v for v in filt_vbuf if not math.isnan(v))
                 else:
-                    local_max = None
-                    for t, v in zip(tbuf, vbuf):
-                        if t >= t_cut:
-                            local_max = v if local_max is None else (v if v > local_max else local_max)
+                    for t, v in zip(tbuf, inst_vbuf):
+                        if t >= t_cut and not math.isnan(v):
+                            values.append(v)
+                    for t, v in zip(tbuf, filt_vbuf):
+                        if t >= t_cut and not math.isnan(v):
+                            values.append(v)
+                if values:
+                    local_max = max(values)
                 if local_max is not None:
                     global_max = local_max if global_max is None else (local_max if local_max > global_max else global_max)
             if global_max is not None:
@@ -401,32 +513,63 @@ class MainWindow(QtWidgets.QMainWindow):
     def attach_device(self, port: str, name: str = 'student', baud: int = 115200):
         if port in self.curves:
             return
+        grp = _modem_group(port)
+        if self.ground_truth_port is None:
+            self.ground_truth_port = port
+            self.ground_truth_group = grp
+            is_student = False
+        else:
+            is_student = (grp != self.ground_truth_group)
+            if is_student:
+                if self.student_port and self.student_port in self.curves and self.student_port != port:
+                    self.remove_device(self.student_port)
+                self.student_port = port
+        self.is_student[port] = is_student
         # buffers
-        self.buffers[port] = (
-            collections.deque(maxlen=self.max_points),
-            collections.deque(maxlen=self.max_points),
-        )
+        self.buffers[port] = {
+            't': collections.deque(maxlen=self.max_points),
+            'inst': collections.deque(maxlen=self.max_points),
+            'filt': collections.deque(maxlen=self.max_points),
+        }
         # UI elements
-        color = self.palette[self.next_color_idx % len(self.palette)]
-        self.next_color_idx += 1
+        if is_student:
+            color_idx = self.next_color_idx % len(self.palette)
+            inst_color = QtGui.QColor(self.palette[color_idx])
+            filt_color = QtGui.QColor(self.palette[(color_idx + 1) % len(self.palette)])
+            self.next_color_idx += 2
+        else:
+            inst_color = None
+            filt_color = QtGui.QColor(self.palette[self.next_color_idx % len(self.palette)])
+            self.next_color_idx += 1
         label = f"{name} ({port})" if name and name != port else port
         device_widget = QtWidgets.QWidget()
         device_layout = QtWidgets.QVBoxLayout(device_widget)
         device_layout.setContentsMargins(8, 4, 8, 4)
         title_label = QtWidgets.QLabel(label)
         title_label.setStyleSheet("color: #666; font-size: 12pt;")
-        value_label = QtWidgets.QLabel("—")
+        value_label = QtWidgets.QLabel("inst: —\nfilt: —" if is_student else "—")
         value_label.setStyleSheet("font-size: 24pt; font-weight: 600;")
         device_layout.addWidget(title_label)
         device_layout.addWidget(value_label)
         self.header_layout.addWidget(device_widget)
         self.value_labels[port] = value_label
         self.port_to_widget[port] = device_widget
-        self.curves[port] = self.plot.plot(pen=pg.mkPen(color, width=2), name=label)
+        if is_student:
+            inst_curve = self.plot.plot(pen=pg.mkPen(inst_color, width=2), name=f"{label} (inst)")
+            filt_pen = pg.mkPen(filt_color, width=2, style=QtCore.Qt.PenStyle.DotLine)
+            filt_curve = self.plot.plot(pen=filt_pen, name=f"{label} (filt)")
+        else:
+            inst_curve = None
+            filt_curve = self.plot.plot(pen=pg.mkPen(filt_color, width=2), name=label)
+        self.curves[port] = {
+            'inst': inst_curve,
+            'filt': filt_curve,
+        }
         self.port_to_name[port] = name
         self.log_by_port.setdefault(port, [])
         # Error lines
-        base_pen = self.curves[port].opts['pen']
+        base_pen_source = inst_curve if inst_curve is not None else filt_curve
+        base_pen = base_pen_source.opts['pen']
         qcolor = base_pen.color()
         dash_pen = pg.mkPen(qcolor, style=QtCore.Qt.PenStyle.DashLine)
         self.err_lower[port] = self.plot.plot(pen=dash_pen)
@@ -444,12 +587,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.known_ports.add(port)
         self.port_to_reader[port] = reader
         print(f"Attached new device: {label} @ {baud}")
-
-        # Track student assignment if not ground truth
-        if _modem_group(port) != self.ground_truth_group:
-            if self.student_port and self.student_port in self.curves and self.student_port != port:
-                self.remove_device(self.student_port)
-            self.student_port = port
 
     @QtCore.Slot()
     def scan_and_attach_new_devices(self):
@@ -485,13 +622,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 reader.stop()
             except Exception:
                 pass
-        # Remove plot curve
-        curve = self.curves.pop(port, None)
-        if curve is not None:
-            try:
-                self.plot.removeItem(curve)
-            except Exception:
-                pass
+        # Remove plot curves
+        curve_dict = self.curves.pop(port, None)
+        if curve_dict is not None:
+            for item in curve_dict.values():
+                if item is None:
+                    continue
+                try:
+                    self.plot.removeItem(item)
+                except Exception:
+                    pass
         # Remove error items
         lower = self.err_lower.pop(port, None)
         upper = self.err_upper.pop(port, None)
@@ -513,6 +653,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Remove buffers and labels
         self.buffers.pop(port, None)
         self.value_labels.pop(port, None)
+        self.is_student.pop(port, None)
         if port in self.known_ports:
             self.known_ports.remove(port)
         self.port_to_name.pop(port, None)
@@ -524,26 +665,60 @@ class MainWindow(QtWidgets.QMainWindow):
             self.logging_active = True
             self.log_rows = []
             self.log_by_port = {p: [] for p in self.curves.keys()}
+            self.log_start_ts = time.time()
             self.btn_log.setText("Stop && Save")
             self.lbl_log_status.setText("Logging: ON")
             self.lbl_log_status.setStyleSheet("color: #0a0;")
+            self.lbl_log_status.setToolTip("")
         else:
             # Stop logging and prompt to save
             self.logging_active = False
             self.btn_log.setText("Start Logging")
-            self.lbl_log_status.setText("Logging: OFF")
             self.lbl_log_status.setStyleSheet("color: #666;")
             if not self.log_rows:
+                self.lbl_log_status.setText("Logging: OFF")
+                self.log_start_ts = None
                 return
             try:
-                path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save CSV", "", "CSV Files (*.csv)")
+                ports = list(self.log_by_port.keys())
+                aligned = len(ports) >= 2 and bool(getattr(self, 'log_rate_hz', None))
+                suggested_path = self._next_log_path(aligned)
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self,
+                    "Save CSV",
+                    str(suggested_path),
+                    "CSV Files (*.csv)",
+                )
                 if not path:
+                    self.lbl_log_status.setText("Logging: OFF")
+                    self.lbl_log_status.setToolTip("")
                     return
-                if not path.lower().endswith('.csv'):
-                    path += '.csv'
-                self._save_log_csv(path)
+                chosen_name = Path(path).name
+                if not chosen_name.lower().endswith('.csv'):
+                    chosen_name += '.csv'
+                target_path = self.log_dir / chosen_name
+                self._save_log_csv(str(target_path))
+                self.lbl_log_status.setText(f"Saved: {target_path.name}")
+                self.lbl_log_status.setToolTip(str(target_path))
+                print(f"Saved log to {target_path}")
             except Exception as e:
+                self.lbl_log_status.setText("Save failed")
+                self.lbl_log_status.setToolTip(str(e))
                 print(f"Failed to save CSV: {e}")
+            finally:
+                self.log_start_ts = None
+
+    def _next_log_path(self, aligned: bool) -> Path:
+        ts = self.log_start_ts or time.time()
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(ts))
+        suffix = "-aligned" if aligned else ""
+        base_name = f"log-{stamp}{suffix}.csv"
+        candidate = self.log_dir / base_name
+        counter = 1
+        while candidate.exists():
+            candidate = self.log_dir / f"log-{stamp}{suffix}-{counter:02d}.csv"
+            counter += 1
+        return candidate
 
     def _save_log_csv(self, filepath: str):
         # If we have two ports, produce fixed-rate samples aligned to a uniform grid
@@ -561,7 +736,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if student_port is None and len(ports) > 1:
                 student_port = [p for p in ports if p != gt_port][0]
 
-            gt_series = sorted(self.log_by_port.get(gt_port, []))  # (ts,val)
+            gt_series = sorted(self.log_by_port.get(gt_port, []))
             st_series = sorted(self.log_by_port.get(student_port, []))
             if gt_series and st_series:
                 t0 = min(gt_series[0][0], st_series[0][0])
@@ -572,14 +747,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 num_steps = int((t1 - t0) / step) + 1
                 grid = [t0 + i * step for i in range(num_steps)]
 
-                def sample_nearest(series, t_target):
+                def sample_nearest(series, t_target, value_index=1):
                     # binary search nearest
                     lo, hi = 0, len(series) - 1
                     best_idx = 0
                     best_dt = float('inf')
                     while lo <= hi:
                         mid = (lo + hi) // 2
-                        tm, _ = series[mid]
+                        tm = series[mid][0]
                         dt = abs(tm - t_target)
                         if dt < best_dt:
                             best_dt = dt
@@ -591,14 +766,17 @@ class MainWindow(QtWidgets.QMainWindow):
                         else:
                             break
                     if best_dt <= tol:
-                        return series[best_idx][1]
+                        val = series[best_idx][value_index] if value_index < len(series[best_idx]) else None
+                        return '' if val is None else val
                     return ''  # empty if no sample within tolerance
 
                 aligned_rows = []
+                record_all = bool(getattr(self, 'record_all', False))
                 for tg in grid:
                     iso = time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(tg)) + f".{int((tg%1)*1000):03d}Z"
                     v_gt = sample_nearest(gt_series, tg)
                     v_st = sample_nearest(st_series, tg)
+                    v_st_filt = sample_nearest(st_series, tg, value_index=2) if record_all else ''
                     def pct(v):
                         if v == '':
                             return ''
@@ -613,16 +791,24 @@ class MainWindow(QtWidgets.QMainWindow):
                             return f"{(dv_abs / vabs) * 100.0:.3f}"
                         except Exception:
                             return ''
-                    aligned_rows.append([
+                    row = [
                         iso,
                         f"{tg:.6f}",
-                        f"{v_gt}" if v_gt=='' else f"{float(v_gt):.6f}",
-                        f"{v_st}" if v_st=='' else f"{float(v_st):.6f}",
+                        f"{v_gt}" if v_gt == '' else f"{float(v_gt):.6f}",
+                        f"{v_st}" if v_st == '' else f"{float(v_st):.6f}",
+                    ]
+                    if record_all:
+                        row.append(f"{v_st_filt}" if v_st_filt == '' else f"{float(v_st_filt):.6f}")
+                    row.extend([
                         pct(v_gt),
                         '',  # student error unknown
                     ])
+                    aligned_rows.append(row)
 
-                header = ['timestamp_iso', 'timestamp_epoch', 'ground_truth_mps', 'student_mps', 'ground_truth_err_pct', 'student_err_pct']
+                header = ['timestamp_iso', 'timestamp_epoch', 'ground_truth_mps', 'student_mps']
+                if record_all:
+                    header.append('student_mps_filtered')
+                header.extend(['ground_truth_err_pct', 'student_err_pct'])
                 try:
                     with open(filepath, 'w', newline='') as f:
                         writer = csv.writer(f)
@@ -637,7 +823,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Raw per-sample rows if only one port or alignment failed
         header = [
             'timestamp_iso', 'timestamp_epoch', 't_rel_s',
-            'device_name', 'port', 'value_raw_mps', 'value_clipped_mps', 'expected_error_pct'
+            'device_name', 'port', 'value_inst_raw_mps', 'value_inst_clipped_mps',
+            'value_filtered_mps', 'expected_error_pct'
         ]
         try:
             with open(filepath, 'w', newline='') as f:
@@ -711,7 +898,13 @@ if __name__ == "__main__":
         print("PyYAML is required. Install with: python3 -m pip install pyyaml")
         sys.exit(1)
 
-    config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+    parser = argparse.ArgumentParser(description="NUCLEO live plotter")
+    parser.add_argument("--config", default=None, help="Optional path to config.yaml")
+    parser.add_argument("--record-all", action="store_true", help="Include both instant and filtered student values in aligned CSV logs")
+    args, qt_args = parser.parse_known_args()
+    qt_argv = [sys.argv[0], *qt_args]
+
+    config_path = args.config or os.path.join(os.path.dirname(__file__), "config.yaml")
     if not os.path.exists(config_path):
         print(f"Config not found: {config_path}")
         list_ports()
@@ -750,8 +943,8 @@ if __name__ == "__main__":
         list_ports()
         sys.exit(1)
 
-    app = QtWidgets.QApplication(sys.argv)
-    w = MainWindow(devices, max_points=max_points, refresh_ms=refresh_ms, window_seconds=window_seconds, max_speed=max_speed, min_speed=min_speed)
+    app = QtWidgets.QApplication(qt_argv)
+    w = MainWindow(devices, max_points=max_points, refresh_ms=refresh_ms, window_seconds=window_seconds, max_speed=max_speed, min_speed=min_speed, record_all=args.record_all)
     w.log_rate_hz = log_rate_hz
     w.align_tolerance_ms = align_tolerance_ms
     w.y_log = y_log

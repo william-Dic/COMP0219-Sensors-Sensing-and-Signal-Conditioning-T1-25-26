@@ -1,9 +1,9 @@
 devices:
   - name: Ground Truth
-    port: /dev/tty.usbmodem141303
+    port: /dev/tty.usbmodem1403
     baud: 115200
   - name: Student
-    port: /dev/tty.usbmodem21203
+    port: /dev/tty.usbmodem1303
     baud: 115200
 ui:
   max_points: 3000
