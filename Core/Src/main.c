@@ -26,7 +26,7 @@
 
 /* 滤波与采样 */
 #define SAMPLE_PERIOD_MS   5      // 5 ms -> 200 Hz
-#define FILTER_ALPHA       0.08f  // smaller -> heavier smoothing
+#define FILTER_ALPHA       0.15f  // smaller -> heavier smoothing
 /* ============================================================================== */
 
 #define FORCE_BIQUAD_B0    0.0200833656f
@@ -75,6 +75,37 @@ static inline int32_t median3(int32_t a, int32_t b, int32_t c)
   if (b > c) { int32_t t = b; b = c; c = t; }
   if (a > b) { int32_t t = a; a = b; b = t; }
   return b;
+}
+
+static void perform_zero_reset(int32_t raw, const char *source)
+{
+  zeroOffset = raw;
+  NAU7802_setZeroOffset(zeroOffset);
+  force_filt_z1 = 0.0f;
+  force_filt_z2 = 0.0f;
+  velocity_filt_lp = 0.0f;
+  velocity_filt_initialized = 0u;
+  memset(raw_history, 0, sizeof(raw_history));
+  raw_hist_filled = 0u;
+  raw_hist_idx = 0u;
+  const char *label = (source != NULL) ? source : "manual";
+  int report = snprintf(uartBuf, sizeof(uartBuf),
+                        "%s zero reset at t=%lums -> %ld counts\r\n",
+                        label, (unsigned long)millis(), (long)zeroOffset);
+  if (report > 0) {
+    HAL_UART_Transmit(&huart2, (uint8_t*)uartBuf, (uint16_t)report, 50);
+  }
+}
+
+static void poll_uart_commands(int32_t raw)
+{
+  // Accept 'r' or 'z' over UART to re-tare without the hardware button
+  uint8_t ch;
+  while (HAL_UART_Receive(&huart2, &ch, 1, 0) == HAL_OK) {
+    if (ch == 'r' || ch == 'R' || ch == 'z' || ch == 'Z') {
+      perform_zero_reset(raw, "UART");
+    }
+  }
 }
 
 /* 在 main() 之前添加这些函数原型，确保编译器知道它们的签名 */
@@ -175,16 +206,11 @@ int main(void)
     // Check blue button (B1 / PC13). Active-low, latch on falling edge.
     GPIO_PinState btn_now = HAL_GPIO_ReadPin(B1_GPIO_Port, B1_Pin);
     if (btn_prev_state == GPIO_PIN_SET && btn_now == GPIO_PIN_RESET) {
-      zeroOffset = raw;
-      NAU7802_setZeroOffset(zeroOffset);
-      int report = snprintf(uartBuf, sizeof(uartBuf),
-                            "Zero offset reset at t=%lums -> %ld counts\r\n",
-                            (unsigned long)millis(), (long)zeroOffset);
-      if (report > 0) {
-        HAL_UART_Transmit(&huart2, (uint8_t*)uartBuf, (uint16_t)report, 50);
-      }
+      perform_zero_reset(raw, "BUTTON");
     }
     btn_prev_state = btn_now;
+
+    poll_uart_commands(raw);
 
     int32_t net = raw - zeroOffset;
 
