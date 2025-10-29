@@ -1,4 +1,5 @@
 "./Core/Inc/nau7802.o"
+"./Core/Src/kalman2d.o"
 "./Core/Src/main.o"
 "./Core/Src/stm32f4xx_hal_msp.o"
 "./Core/Src/stm32f4xx_it.o"

@@ -1,5 +1,6 @@
 #include "main.h"
 #include "nau7802.h"
+#include "kalman2d.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -23,12 +24,21 @@
 #define FILTER_ALPHA       0.15f
 
 /* --- Wind-cup configuration --- */
-#define WINDCUP_SAMPLE_PERIOD_MS    1000u
+#define WINDCUP_SAMPLE_PERIOD_MS    50u
 #define WINDCUP_PULSES_PER_REV      256
 #define WINDCUP_CALIBRATION_FACTOR  0.05f
 #define WINDCUP_FILTER_ALPHA        0.20f
 #define WINDCUP_MIN_VALID_RPM       0.0f
 /* ============================================================================== */
+
+#define ENABLE_KALMAN_FUSION   1u   // set to 0 to disable Kalman fusion
+#define TELEMETRY_DECIMATION   2u   // print every N iterations (200 Hz / 2 = 100 Hz)
+
+#define KALMAN_P0_V          4.0f
+#define KALMAN_P0_A         25.0f
+#define KALMAN_SIGMA_A2    100.0f
+#define KALMAN_R_PLATE       0.04f
+#define KALMAN_R_RPM         0.16f
 
 #define FORCE_BIQUAD_B0    0.0200833656f
 #define FORCE_BIQUAD_B1    0.0401667311f
@@ -41,8 +51,21 @@
 
 #if PRINT_MODE == 0
 static const char CSV_HEADER[] =
-  "ts_ms,loadcell.raw_counts,loadcell.net_counts,loadcell.force_newton,loadcell.v_inst_mps,loadcell.v_filt_mps,windcup.rpm,windcup.v_inst_mps,windcup.v_filt_mps";
+  "ts_ms,loadcell.v_inst_mps,loadcell.v_filt_mps,windcup.v_inst_mps,windcup.v_filt_mps,fusion.v_inst_mps,fusion.v_filt_mps";
 #endif
+
+static void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_TIM3_Init(void);
+static void WindFusion_Init(void);
+static void WindFusion_Reset(void);
+static void WindFusion_Step(float dt_sec,
+                            float v_plate_filt,
+                            float wind_speed_rpm,
+                            uint8_t rpm_new_sample_available,
+                            uint8_t rpm_is_reliable);
 
 I2C_HandleTypeDef hi2c1;
 TIM_HandleTypeDef htim3;
@@ -64,6 +87,7 @@ static uint8_t velocity_filt_initialized = 0u;
 static int32_t raw_history[3] = {0};
 static uint8_t raw_hist_filled = 0u;
 static uint8_t raw_hist_idx = 0u;
+static uint32_t telemetry_counter = 0u;
 
 /* Wind-cup state */
 static uint16_t windcup_last_counter = 0u;
@@ -73,6 +97,22 @@ static float windcup_rpm = 0.0f;
 static float windcup_speed_inst = 0.0f;
 static float windcup_speed_filt = 0.0f;
 static uint8_t windcup_speed_initialized = 0u;
+static uint8_t windcup_last_reliable = 0u;
+
+static void WindFusion_Init(void);
+static void WindFusion_Reset(void);
+static void WindFusion_Step(float dt_sec,
+                            float v_plate_filt,
+                            float wind_speed_rpm,
+                            uint8_t rpm_new_sample_available,
+                            uint8_t rpm_is_reliable);
+
+/* Kalman fusion state */
+#if ENABLE_KALMAN_FUSION
+static Kalman2D_t wind_kf;
+#endif
+static float fused_speed_mps = 0.0f;
+static float fused_accel_mps2 = 0.0f;
 
 static inline uint32_t millis(void) { return HAL_GetTick(); }
 
@@ -98,6 +138,8 @@ static void perform_zero_reset(int32_t raw, const char *source)
   windcup_speed_filt = 0.0f;
   windcup_speed_inst = 0.0f;
   windcup_speed_initialized = 0u;
+  windcup_last_reliable = 0u;
+  WindFusion_Reset();
   const char *label = (source != NULL) ? source : "manual";
   int report = snprintf(uartBuf, sizeof(uartBuf),
                         "%s zero reset at t=%lums -> %ld counts\r\n",
@@ -124,11 +166,60 @@ static void poll_uart_commands(int32_t raw)
   }
 }
 
-static void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_USART2_UART_Init(void);
-static void MX_I2C1_Init(void);
-static void MX_TIM3_Init(void);
+static void WindFusion_Reset(void)
+{
+#if ENABLE_KALMAN_FUSION
+  const float v0_init = 0.0f;
+  const float a0_init = 0.0f;
+
+  Kalman2D_Init(&wind_kf,
+                v0_init,
+                a0_init,
+                KALMAN_P0_V,
+                KALMAN_P0_A,
+                KALMAN_SIGMA_A2,
+                KALMAN_R_PLATE,
+                KALMAN_R_RPM);
+
+  fused_speed_mps = v0_init;
+  fused_accel_mps2 = a0_init;
+#else
+  fused_speed_mps = 0.0f;
+  fused_accel_mps2 = 0.0f;
+#endif
+  windcup_last_reliable = 0u;
+}
+
+static void WindFusion_Init(void)
+{
+  WindFusion_Reset();
+}
+
+static void WindFusion_Step(float dt_sec,
+                            float v_plate_filt,
+                            float wind_speed_rpm,
+                            uint8_t rpm_new_sample_available,
+                            uint8_t rpm_is_reliable)
+{
+#if ENABLE_KALMAN_FUSION
+  Kalman2D_Predict(&wind_kf, dt_sec);
+  Kalman2D_UpdatePlate(&wind_kf, v_plate_filt);
+
+  if (rpm_new_sample_available) {
+    Kalman2D_UpdateRPM(&wind_kf, wind_speed_rpm, rpm_is_reliable);
+  }
+
+  fused_speed_mps = Kalman2D_GetWindMPS(&wind_kf);
+  fused_accel_mps2 = Kalman2D_GetWindAccel(&wind_kf);
+#else
+  (void)wind_speed_rpm;
+  (void)rpm_new_sample_available;
+  (void)rpm_is_reliable;
+  (void)dt_sec;
+  fused_speed_mps = v_plate_filt;
+  fused_accel_mps2 = 0.0f;
+#endif
+}
 
 int main(void)
 {
@@ -165,6 +256,8 @@ int main(void)
   C0_N_per_mps2 = 0.5f * AIR_RHO * DRAG_CD * A;
   C_used = (CALIBRATED_C_OVERRIDE > 0.0f) ? CALIBRATED_C_OVERRIDE : C0_N_per_mps2;
 
+  WindFusion_Init();
+
   int len = snprintf(uartBuf, sizeof(uartBuf),
     "Anemometer start\r\n"
     "zeroOffset (b): %ld counts\r\n"
@@ -185,7 +278,7 @@ int main(void)
                   "CSV columns (units):\r\n%s\r\n", CSV_HEADER);
 #else
   len += snprintf(uartBuf + len, sizeof(uartBuf) - (size_t)len,
-                  "PRETTY telemetry keys: ts_ms, loadcell.raw/net/force/v_inst/v_filt, windcup.rpm/v_inst/v_filt\r\n");
+                  "PRETTY telemetry keys: ts_ms, loadcell.v_inst/v_filt, windcup.v_inst/v_filt, fusion.v_inst/v_filt, fusion.a\r\n");
 #endif
   HAL_UART_Transmit(&huart2, (uint8_t*)uartBuf, len, 200);
 
@@ -194,6 +287,7 @@ int main(void)
 
   uint32_t next_tick = millis();
   const float eps = 1e-9f;
+  const float kalman_dt_sec = (float)SAMPLE_PERIOD_MS * 0.001f;
 #if PRINT_MODE == 0
   uint32_t lines_since_header = HEADER_EVERY_N_LINES;
 #endif
@@ -218,6 +312,7 @@ int main(void)
 
     poll_uart_commands(raw);
 
+    uint8_t rpm_new_sample_available = 0u;
     uint16_t windcup_counter_now = __HAL_TIM_GET_COUNTER(&htim3);
     int16_t pulse_delta = (int16_t)(windcup_counter_now - windcup_last_counter);
     windcup_last_counter = windcup_counter_now;
@@ -231,25 +326,36 @@ int main(void)
         float pulses = (float)windcup_pulse_accum;
         float revs = pulses / (float)WINDCUP_PULSES_PER_REV;
         float rpm_now = (revs / elapsed_s) * 60.0f;
-        if (rpm_now < WINDCUP_MIN_VALID_RPM) rpm_now = 0.0f;
+        if (rpm_now < WINDCUP_MIN_VALID_RPM) {
+          rpm_now = 0.0f;
+        }
         windcup_rpm = rpm_now;
         windcup_speed_inst = windcup_rpm * WINDCUP_CALIBRATION_FACTOR;
-        if (windcup_speed_inst < 0.0f) windcup_speed_inst = 0.0f;
+        if (windcup_speed_inst < 0.0f) {
+          windcup_speed_inst = 0.0f;
+        }
         if (!windcup_speed_initialized) {
           windcup_speed_filt = windcup_speed_inst;
           windcup_speed_initialized = 1u;
         } else {
           windcup_speed_filt += WINDCUP_FILTER_ALPHA * (windcup_speed_inst - windcup_speed_filt);
         }
-        if (windcup_speed_filt < 0.0f) windcup_speed_filt = 0.0f;
+        if (windcup_speed_filt < 0.0f) {
+          windcup_speed_filt = 0.0f;
+        }
+        windcup_last_reliable = (windcup_rpm > WINDCUP_MIN_VALID_RPM) ? 1u : 0u;
+        rpm_new_sample_available = 1u;
       } else {
         windcup_rpm = 0.0f;
         windcup_speed_inst = 0.0f;
         windcup_speed_filt = 0.0f;
+        windcup_last_reliable = 0u;
+        rpm_new_sample_available = 1u;
       }
       windcup_pulse_accum = 0;
       windcup_last_report_ms = loop_time_ms;
     }
+    uint8_t rpm_is_reliable = windcup_last_reliable;
 
     int32_t net = raw - zeroOffset;
 
@@ -271,29 +377,40 @@ int main(void)
     }
     v_filt = velocity_filt_lp;
 
+    WindFusion_Step(kalman_dt_sec,
+                    v_filt,
+                    windcup_speed_filt,
+                    rpm_new_sample_available,
+                    rpm_is_reliable);
+
     uint32_t t = loop_time_ms;
 
+    if ((telemetry_counter++ % TELEMETRY_DECIMATION) == 0u) {
 #if PRINT_MODE == 0
-    if (lines_since_header >= HEADER_EVERY_N_LINES) {
-      int header_len = snprintf(uartBuf, sizeof(uartBuf), "%s\r\n", CSV_HEADER);
-      HAL_UART_Transmit(&huart2, (uint8_t*)uartBuf, header_len, 50);
-      lines_since_header = 0;
-    }
-    int outlen = snprintf(uartBuf, sizeof(uartBuf),
-      "ts_ms=%lu,loadcell.raw=%ld,loadcell.net=%ld,loadcell.force=%.6f,loadcell.v_inst=%.4f,loadcell.v_filt=%.4f,windcup.rpm=%.3f,windcup.v_inst=%.3f,windcup.v_filt=%.3f\r\n",
-      (unsigned long)t, (long)raw, (long)net,
-      (double)force_lp, (double)v_inst, (double)v_filt,
-      (double)windcup_rpm, (double)windcup_speed_inst, (double)windcup_speed_filt);
-    HAL_UART_Transmit(&huart2, (uint8_t*)uartBuf, outlen, 50);
-    lines_since_header++;
+      if (lines_since_header >= HEADER_EVERY_N_LINES) {
+        int header_len = snprintf(uartBuf, sizeof(uartBuf), "%s\r\n", CSV_HEADER);
+        HAL_UART_Transmit(&huart2, (uint8_t*)uartBuf, header_len, 50);
+        lines_since_header = 0;
+      }
+      int outlen = snprintf(uartBuf, sizeof(uartBuf),
+        "ts_ms=%lu,loadcell.v_inst=%.3f,loadcell.v_filt=%.3f,windcup.v_inst=%.3f,windcup.v_filt=%.3f,fusion.v_inst=%.3f,fusion.v_filt=%.3f\r\n",
+        (unsigned long)t,
+        (double)v_inst, (double)v_filt,
+        (double)windcup_speed_inst, (double)windcup_speed_filt,
+        (double)fused_speed_mps, (double)fused_speed_mps);
+      HAL_UART_Transmit(&huart2, (uint8_t*)uartBuf, outlen, 50);
+      lines_since_header++;
 #else
-    int outlen = snprintf(uartBuf, sizeof(uartBuf),
-      "ts=%lums | loadcell.raw=%ld cnt | loadcell.net=%ld cnt | loadcell.force=%.6f N | loadcell.v_inst=%.3f m/s | loadcell.v_filt=%.3f m/s | windcup.rpm=%.3f | windcup.v_inst=%.3f m/s | windcup.v_filt=%.3f m/s\r\n",
-      (unsigned long)t, (long)raw, (long)net,
-      (double)force_lp, (double)v_inst, (double)v_filt,
-      (double)windcup_rpm, (double)windcup_speed_inst, (double)windcup_speed_filt);
-    HAL_UART_Transmit(&huart2, (uint8_t*)uartBuf, outlen, 50);
+      int outlen = snprintf(uartBuf, sizeof(uartBuf),
+        "ts=%lums | loadcell.v_inst=%.3f m/s | loadcell.v_filt=%.3f m/s | windcup.v_inst=%.3f m/s | windcup.v_filt=%.3f m/s | fusion.v_inst=%.3f m/s | fusion.v_filt=%.3f m/s | fusion.a=%.3f m/s^2\r\n",
+        (unsigned long)t,
+        (double)v_inst, (double)v_filt,
+        (double)windcup_speed_inst, (double)windcup_speed_filt,
+        (double)fused_speed_mps, (double)fused_speed_mps,
+        (double)fused_accel_mps2);
+      HAL_UART_Transmit(&huart2, (uint8_t*)uartBuf, outlen, 50);
 #endif
+    }
 
     int32_t now = (int32_t)millis();
     int32_t wait_ms = (int32_t)next_tick - now;
@@ -433,4 +550,3 @@ void Error_Handler(void)
   __disable_irq();
   while (1) {}
 }
-
