@@ -1,37 +1,49 @@
+import time
 import cv2
+import numpy as np
+# 导入树莓派5专用的相机库
+from picamera2 import Picamera2
 
-# 初始化摄像头
-cap = cv2.VideoCapture(0)
+print("正在初始化 Picamera2 (RPi 5)...")
 
-# 设置分辨率 (建议设置为高一点，方便看清细节)
-cap.set(3, 1280)
-cap.set(4, 720)
+# 1. 初始化相机
+picam2 = Picamera2()
 
-print("正在运行调焦助手...")
-print("请旋转镜头调整焦距。")
-print("按 'q' 键退出。")
+# 2. 配置相机
+# size: 分辨率 (640x480 对树莓派负担小，帧率高)
+# format: BGR888 是 OpenCV 默认的颜色格式
+config = picam2.create_preview_configuration(main={"size": (640, 480), "format": "BGR888"})
+picam2.configure(config)
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("无法读取摄像头")
-        break
+# 3. 启动相机
+picam2.start()
 
-    # 获取画面中心点
-    height, width = frame.shape[:2]
-    cx, cy = int(width / 2), int(height / 2)
+print("相机已启动。按 'q' 键退出。")
 
-    # 画一个十字准星，方便对焦观察
-    # 水平线
-    cv2.line(frame, (cx - 20, cy), (cx + 20, cy), (0, 0, 255), 2)
-    # 垂直线
-    cv2.line(frame, (cx, cy - 20), (cx, cy + 20), (0, 0, 255), 2)
+try:
+    while True:
+        # 4. 直接获取图像数组 (这比 cv2.VideoCapture 快得多且不报错)
+        frame = picam2.capture_array()
 
-    cv2.imshow("Focus Adjustment", frame)
+        # --- 下面是画十字准星的逻辑 (和之前一样) ---
+        height, width = frame.shape[:2]
+        cx, cy = int(width / 2), int(height / 2)
+        
+        # 画红色十字
+        cv2.line(frame, (cx - 20, cy), (cx + 20, cy), (0, 0, 255), 2)
+        cv2.line(frame, (cx, cy - 20), (cx, cy + 20), (0, 0, 255), 2)
+        # ---------------------------------------
 
-    # 按 q 退出
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        cv2.imshow("RPi 5 Focus Tool", frame)
 
-cap.release()
-cv2.destroyAllWindows()
+        # 按 q 退出
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except Exception as e:
+    print(f"发生错误: {e}")
+
+finally:
+    # 清理资源
+    picam2.stop()
+    cv2.destroyAllWindows()
